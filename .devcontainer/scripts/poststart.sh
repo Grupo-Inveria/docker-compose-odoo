@@ -48,12 +48,33 @@ build_workspace() {
     # adhoc-way, oba-wiki, oba-specs, ingadhoc-skills, etc., y también
     # overrides de baked como odoo/ o enterprise/ si el dev los clona).
     # Se listan dinámicos en AGENTS.md para reflejar qué clonó cada dev.
+    # Excluye los contextos *-ctx — esos se listan en sección router aparte.
     declare -A custom_others
     for d in "$CUSTOM"/*/; do
         [[ -d "$d" ]] || continue
         name=$(basename "$d")
         [[ $name == .* || $name == repositories || $name == src || $name == adhoc || $name == tmp* ]] && continue
+        [[ $name == *-ctx ]] && continue
         custom_others[$name]=1
+    done
+
+    # Contextos (folders *-ctx) — detección "custom gana, src fallback".
+    # Pattern documentado en T-67744: el agente IA detecta qué contextos
+    # están disponibles y a qué path apuntan. El dev NO ve el contexto en
+    # su workspace (no se symlinkea al top-level) salvo que lo clone
+    # explícito en custom/. Si el contexto solo existe en src/ (baked en la
+    # imagen), el path en el router apunta directo a src/<X-ctx>/.
+    declare -A contexts
+    for item in "$CUSTOM"/*-ctx/; do
+        [[ -d "$item" ]] || continue
+        name=$(basename "$item")
+        contexts[$name]="${item%/}"
+    done
+    for item in "$SRC"/*-ctx/; do
+        [[ -d "$item" ]] || continue
+        name=$(basename "$item")
+        [[ -n "${contexts[$name]:-}" ]] && continue
+        contexts[$name]="${item%/}"
     done
 
     # src/ — espejo de /home/odoo/src/: solo repos con .git, deduplicados contra custom/
@@ -83,11 +104,44 @@ build_workspace() {
 
     # AGENTS.md dinámico + CLAUDE.md/GEMINI.md (estándar adhoc-way)
     {
-        cat <<'HEADER'
+        cat <<'INTRO'
 # Workspace OBA
 
 Iniciá `claude`, `codex` o `gemini` desde `/home/odoo/custom/` para trabajo cross-repo.
 Para bugs acotados a un módulo podés iniciar desde ese repo directamente.
+
+## Modos de trabajo (router de contextos)
+
+Al pararte acá con un agente IA, elegí el modo según el tema. Los contextos se detectan automáticamente — `custom/<X-ctx>/` (clonado por el dev) gana sobre `/home/odoo/src/<X-ctx>/` (baked en la imagen). El dev no ve el contexto en su workspace salvo que lo clone explícito; el agente sí sabe que existe via este listado.
+
+INTRO
+        if [[ ${#contexts[@]} -eq 0 ]]; then
+            echo "_Sin contextos detectados todavía._"
+        else
+            for name in $(echo "${!contexts[@]}" | tr ' ' '\n' | sort); do
+                path="${contexts[$name]}"
+                base="${name%-ctx}"
+                case "$name" in
+                    adhoc-way-ctx)
+                        desc="onboarding al patrón adhoc-way, convenciones del ecosistema, specs, ADRs (subdirs: adhoc-way, oba-wiki)"
+                        ;;
+                    devops-ctx)
+                        desc="tareas DevOps: k8s/Pulumi, charts Helm, OCI bake, herramientas internas"
+                        ;;
+                    *)
+                        desc=""
+                        ;;
+                esac
+                if [[ -n "$desc" ]]; then
+                    echo "- **$base** ($desc): \`$path/\`"
+                else
+                    echo "- **$base**: \`$path/\`"
+                fi
+            done
+        fi
+        cat <<'STRUCT'
+
+**Default** (sin contexto explícito): módulos OBA, tareas Tuqui, debugging Odoo. Seguir lo que sigue en este AGENTS.md.
 
 ## Estructura
 
@@ -98,7 +152,7 @@ Para bugs acotados a un módulo podés iniciar desde ese repo directamente.
 
 ## Repos en custom/ (fuera de repositories/ y src/)
 
-HEADER
+STRUCT
         if [[ ${#custom_others[@]} -eq 0 ]]; then
             echo "_Ninguno todavía._"
         else
@@ -141,6 +195,13 @@ EOF
     echo "Overlay construido: custom/src/ ($src_count repos directos, $repo_count en repositories/)"
 }
 build_workspace
+
+# Compartir sesiones de Claude Code host↔container.
+# Delegado al script standalone para que postStartCommand también pueda
+# correrlo (en cada start del container, no solo en postCreate como
+# poststart.sh) y captar proyectos nuevos del host sin necesidad de
+# rebuild. Detalle de la lógica en share-claude-sessions.sh.
+/scripts/share-claude-sessions.sh || true
 
 # workspace-add / workspace-rm — comandos para traer/sacar repos de src/ bajo demanda
 WORKSPACE_ADD="$HOME/.local/bin/workspace-add"
@@ -437,8 +498,10 @@ else
 fi
 
 # Convenciones Adhoc adentro del container — capa Usuario + capa Workspace.
-# Requiere adhoc-way clonado en data/custom/ingadhoc-adhoc-way/ (convención de
-# prefijo ingadhoc- para repos de la org).
+# Busca adhoc-way con resolución "custom gana, src fallback":
+#   1. custom/adhoc-way-ctx/adhoc-way/  ← layout actual con contextos
+#   2. custom/ingadhoc-adhoc-way/       ← layout legacy (prefijo ingadhoc-)
+#   3. src/adhoc-way-ctx/adhoc-way/     ← baked en imagen dev (default)
 # - Capa Usuario  (--target $HOME): bloque managed en ~/.claude/CLAUDE.md,
 #   ~/.codex/AGENTS.md, ~/.gemini/GEMINI.md y ~/.adhoc/conventions.md.
 # - Capa Workspace (--target $HOME/custom --workspace-block-only): bloque
@@ -446,8 +509,18 @@ fi
 #   inyectado al final del AGENTS.md que generó build_workspace. NO toca
 #   .claude/.codex/.gemini/.adhoc/ en custom/ (esos no deben existir ahí).
 #   Spec 0012 Eje 3.
-ADHOC_WAY_INSTALL="$HOME/custom/ingadhoc-adhoc-way/scripts/adhoc-way-install-user.sh"
-if [ -x "$ADHOC_WAY_INSTALL" ]; then
+ADHOC_WAY_INSTALL=""
+for candidate in \
+    "$HOME/custom/adhoc-way-ctx/adhoc-way/scripts/adhoc-way-install-user.sh" \
+    "$HOME/custom/ingadhoc-adhoc-way/scripts/adhoc-way-install-user.sh" \
+    "$HOME/src/adhoc-way-ctx/adhoc-way/scripts/adhoc-way-install-user.sh" ; do
+    if [ -x "$candidate" ]; then
+        ADHOC_WAY_INSTALL="$candidate"
+        break
+    fi
+done
+
+if [ -n "$ADHOC_WAY_INSTALL" ]; then
     echo "Instalando capa Usuario desde $ADHOC_WAY_INSTALL (target=\$HOME)"
     "$ADHOC_WAY_INSTALL" --target "$HOME" && echo "Capa Usuario OK."
 
@@ -467,8 +540,8 @@ EOF
     chmod +x "$REFRESH_BIN"
     echo "refresh-workspace disponible en $REFRESH_BIN"
 else
-    echo "AVISO: adhoc-way no disponible en custom/ingadhoc-adhoc-way/ — capa Usuario/Workspace no instaladas."
-    echo "  Para activarlas: clonar git@github.com:ingadhoc/adhoc-way en data/custom/ingadhoc-adhoc-way."
+    echo "AVISO: adhoc-way no encontrado — capa Usuario/Workspace no instaladas."
+    echo "  Buscado en: custom/adhoc-way-ctx/adhoc-way/, custom/ingadhoc-adhoc-way/, src/adhoc-way-ctx/adhoc-way/."
 fi
 
 # DevOps workspace context — Eje 2 + Eje 3 de devops-workspace-context spec
@@ -521,6 +594,19 @@ Activado automáticamente por `poststart.sh` cuando `~/.adhoc/teams`
 contiene `devops`. Spec madre:
 `devops-specs/specs/10_draft/devops-workspace-context.md`.
 
+## Cuándo iniciar Claude acá vs en `custom/`
+
+- **DevOps puro** (infra, seguridad, k8s, Pulumi, Helm, OCI bake, IaC):
+  iniciar desde `custom/devops-ctx/`. Carga este `AGENTS.md` primero
+  → el agente arranca con contexto del stack en vez de pegárselo cada
+  vez.
+- **DevOps ↔ Odoo** (módulo `saas_k8s`, bake de versión nueva que toca
+  addons, helm chart que consume un módulo, debugging end-to-end):
+  iniciar desde `custom/`. Carga el `AGENTS.md` del workspace OBA con
+  las reglas cross-repo + lista de addons + reglas Tuqui.
+- **Editar specs / ADRs del team:** iniciar desde
+  `custom/devops-ctx/devops-specs/`.
+
 ## Repos en este folder
 
 - `oci-odoo-by-adhoc` (`adhoc-cicd/`) — bake de la imagen Odoo by Adhoc.
@@ -552,6 +638,54 @@ contiene `devops`. Spec madre:
   los clusters. Se apoya en `pylib_odoo_saas`. El módulo vive en
   `custom/repositories/` (lado Odoo), no acá.
 
+## Wiki provisoria — dónde está cada cosa
+
+No hay un `devops-wiki` dedicado (todavía). La documentación técnica
+del stack vive en el `doc/` de cada repo, con grados de detalle muy
+distintos. Mapa rápido:
+
+- **`devops-cloud-infra/doc/`** — el más rico hoy. Arquitectura
+  (`architecture.md` + `architecture-diagrams.md`), CI/CD (`cicd.md`),
+  networking (`networking-overview.md`, `networks.md`, `psc.md`),
+  identity / access (`identity-access-overview.md`, `groups.md`,
+  `connect-gateway-authz.md`, `connect-gateway.md`), ingress
+  (`ingress-overview.md`, `gateway-api.md`), bastion (`bastion.md`),
+  apps en k8s (`k8s_apps.md`), GKE (`gke-overview.md`), config
+  (`config.md`). Empezar acá para cualquier pregunta sobre el cluster
+  nuevo.
+- **`oci-odoo-by-adhoc/doc/`** — bake de imagen Odoo. `layers.md`,
+  `dependencies.md`, `others.md`, drawings excalidraw.
+- **`pylib_odoo_saas/doc/`** — placeholder mínimo; leer `src/` y
+  `test/` directo.
+- **`helm-charts/README.MD`** + `charts/<chart>/` — referencia de cada
+  chart vive en el README del chart correspondiente.
+- **`devops-ops-tools/readme.md`** + `specifications.md` — overview
+  de las imágenes no-Odoo.
+- **`devops-specs/specs/`** + `decisions/` — specs y ADRs del team.
+  `30_done/` decisiones cerradas, `10_draft/` lo que está en arranque.
+
+Cuando una pregunta no encuentre respuesta en `doc/`, leer el código
+fuente directo (Pulumi en `__main__.py` + `k8s_apps/` + `infra_cell/`
++ `infra_fleethost/`; charts en `helm-charts/charts/`; Dockerfiles en
+`oci-odoo-by-adhoc/<version>/`). **No inventar** — si no está
+documentada, decirlo.
+
+## Tuqui Adhoc — connector operativo, no source of truth técnica
+
+Análogo a la regla del workspace OBA (`custom/AGENTS.md`):
+
+- **Sí (connector):** leer tareas / tickets / chatter de DevOps,
+  registrar PRs contra una tarea, postear updates en chatter,
+  consultar `saas.pull.request` / `adhoc.module`, transcribir videos.
+- **No (source of truth técnica):** responder "cómo funciona X en el
+  stack" con `odoo_search_read`. La info **no vive en Odoo** — vive en
+  los repos clonados acá (`devops-cloud-infra/doc/`, `helm-charts/`,
+  Dockerfiles, código Pulumi). Leer ahí antes que llamar al MCP.
+
+`tuqui_context` se corre cuando hay caso explícito (tarea / ticket /
+PR), no por reflejo. Cualquier `odoo_create` / `odoo_write` /
+`message_post` / `unlink` requiere OK explícito por cada acción.
+
 ## Convenciones DevOps
 
 - **Kubeconfigs** viven en `~/.kube/config` (no en este folder, no se
@@ -580,6 +714,38 @@ poststart.sh` o (mejor) promoverlo a un template versionado en
 `devops-specs`._
 AGENTS_MD
 
+    # CLAUDE.md y GEMINI.md — punteros cortos a AGENTS.md (ADR 0001 adhoc-way).
+    cat > "$devops_ctx/CLAUDE.md" <<'CLAUDE_MD'
+# CLAUDE.md
+
+Este folder adopta **[`AGENTS.md`](./AGENTS.md)** como fuente canónica
+de instrucciones para agentes de IA (ADR 0001 adhoc-way).
+
+> Antes de responder cualquier mensaje en este folder, leé `AGENTS.md`
+> y aplicá sus instrucciones — sobre todo la sección "Cuándo iniciar
+> Claude acá vs en `custom/`" y "Tuqui Adhoc — connector operativo".
+> Esta carga manual es necesaria porque Claude Code auto-carga solo
+> `CLAUDE.md`, no `AGENTS.md`.
+
+Este archivo es regenerado en cada `poststart.sh`. Para editarlo
+permanentemente, modificar el heredoc en `.devcontainer/scripts/
+poststart.sh`.
+CLAUDE_MD
+
+    cat > "$devops_ctx/GEMINI.md" <<'GEMINI_MD'
+# GEMINI.md
+
+Este folder adopta **[`AGENTS.md`](./AGENTS.md)** como fuente canónica
+de instrucciones para agentes de IA (ADR 0001 adhoc-way).
+
+Antes de responder, leé `AGENTS.md` — sobre todo "Cuándo iniciar
+Claude acá vs en `custom/`" y "Tuqui Adhoc — connector operativo".
+
+Este archivo es regenerado en cada `poststart.sh`. Para editarlo
+permanentemente, modificar el heredoc en `.devcontainer/scripts/
+poststart.sh`.
+GEMINI_MD
+
     # README del folder con instrucciones de regen / opt-out.
     cat > "$devops_ctx/README.md" <<'README_MD'
 # devops-ctx
@@ -605,7 +771,7 @@ Sacar la línea `devops` de `~/.adhoc/teams` (host). En la próxima
 rebuild, el folder queda intacto pero no se actualizan los clones.
 README_MD
 
-    echo "  custom/devops-ctx/ OK (6 repos default + AGENTS.md + README.md)."
+    echo "  custom/devops-ctx/ OK (6 repos default + AGENTS.md + CLAUDE.md + GEMINI.md + README.md)."
 }
 init_devops_ctx
 
