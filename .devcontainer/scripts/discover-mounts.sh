@@ -45,6 +45,8 @@ PROJECTS=(
     # con flag opt-in en lugar de auto, o cambiando el target fuera de
     # custom/devops/ para evitar el bind anidado.
     # "docker-compose-odoo|${REPO_ROOT}|/home/odoo/custom/devops/docker-compose-odoo|devops"
+    "odumbo|${HOME}/repositorios/odumbo|/home/odoo/custom/odumbo|"
+    "consultoria-tecnica|${HOME}/repositorios/consultoria-tecnica|/home/odoo/custom/consultoria-tecnica|"
 )
 
 declare -A PRESENT=()
