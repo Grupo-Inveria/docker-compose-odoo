@@ -55,12 +55,21 @@ build_workspace() {
     # un layout legacy con clones internos, lo migra a mounts post-rebuild.
     declare -A custom_others
     declare -A projects
+    declare -A stale_mounts
     for d in "$CUSTOM"/*/; do
         [[ -d "$d" ]] || continue
         name=$(basename "$d")
         [[ $name == .* || $name == repositories || $name == src || $name == adhoc || $name == tmp* ]] && continue
         if [[ -f "$d/AGENTS.md" ]]; then
             projects[$name]="${d%/}"
+        elif [[ -z "$(ls -A "$d" 2>/dev/null)" ]]; then
+            # Dir vacío directo bajo custom/ = casi seguro un mountpoint viejo que
+            # quedó tras sacar o renombrar un bind (p.ej. custom/oba-project tras
+            # el rename del proyecto a oba). No es un repo: lo dejamos fuera del
+            # listado de "otros repos". El AVISO accionable (con `sudo rmdir`) lo
+            # da discover-mounts.sh en el HOST (initializeCommand, siempre visible
+            # en el log del rebuild — el postStart lo colapsa VS Code).
+            stale_mounts[$name]=1
         else
             custom_others[$name]=1
         fi
@@ -599,10 +608,16 @@ echo "refresh-workspace disponible en $REFRESH_BIN"
 # Los mounts se generan auto en el HOST pre-rebuild via
 # `discover-mounts.sh` (initializeCommand de devcontainer.json), que
 # detecta presencia de paths del ecosistema y los emite a
-# `docker-compose.auto-mounts.yml`. El catálogo de paths ya NO está
-# hardcodeado: lo declara `oba-project/.adhoc/topology.yml` (trabajo C —
-# spec adhoc-way `estandarizacion-oba.md` §4); discover-mounts.sh lo lee
-# desde el host (seed `${HOME}/repositorios/oba-project`).
+# `docker-compose.auto-mounts.yml`. Convención de paths host por defecto
+# (catálogo hardcodeado en discover-mounts.sh — config de este devcontainer):
+#
+#   ${HOME}/repositorios/devops/              → /home/odoo/custom/devops
+#   ${HOME}/repositorios/adhoc-way/           → /home/odoo/custom/adhoc-way
+#   ${HOME}/tuqui/                            → /home/odoo/custom/tuqui
+#   ${HOME}/repositorios/oba/                 → /home/odoo/custom/oba
+#   ${HOME}/repositorios/oba-project-memory/  → /home/odoo/custom/oba-project-memory
+#   ${HOME}/repositorios/odumbo/              → /home/odoo/custom/odumbo
+#   ${HOME}/repositorios/consultoria-tecnica/ → /home/odoo/custom/consultoria-tecnica
 #
 # Para paths no-default o repos fuera del catálogo, el dev declara mounts
 # manuales en `docker-compose.override.yml` (opt-in, gitignored).
@@ -703,7 +718,52 @@ else
     echo "Claude Code settings.json ya existe — respeto config propia ($CLAUDE_SETTINGS)"
 fi
 
-if [[ "${AD_DEV_USER_TYPE:-}" == "DEVOPS" ]]; then
+if [[ "${R2_ENABLE_DEVOPS:-0}" == "1" ]]; then
+    # kubectl
+    if ! command -v kubectl &>/dev/null; then
+        echo "Instalando kubectl..."
+        KUBECTL_VERSION=$(curl -Ls https://dl.k8s.io/release/stable.txt)
+        curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o /tmp/kubectl \
+            && chmod +x /tmp/kubectl && sudo mv /tmp/kubectl /usr/local/bin/kubectl \
+            && echo "kubectl ${KUBECTL_VERSION} instalado." \
+            || echo "FALLO: no se pudo instalar kubectl"
+    else
+        echo "kubectl ya presente ($(kubectl version --client -o json 2>/dev/null | grep gitVersion | head -1 || echo '?'))."
+    fi
+
+    # helm
+    if ! command -v helm &>/dev/null; then
+        echo "Instalando helm..."
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash \
+            && echo "helm $(helm version --short 2>/dev/null) instalado." \
+            || echo "FALLO: no se pudo instalar helm"
+    else
+        echo "helm ya presente ($(helm version --short 2>/dev/null))."
+    fi
+
+    # Docker CLI — DooD: el socket del host está montado en /var/run/docker.sock.
+    # usermod no toma efecto en la sesión actual; chmod 666 cubre el acceso inmediato.
+    if ! command -v docker &>/dev/null; then
+        echo "Instalando Docker CLI..."
+        sudo apt-get -qq update \
+            && sudo apt-get -qq install -y --no-install-recommends docker.io \
+            && echo "Docker CLI instalado." \
+            || echo "FALLO: no se pudo instalar Docker CLI"
+    else
+        echo "docker ya presente ($(docker --version 2>/dev/null))."
+    fi
+    if [ -S /var/run/docker.sock ]; then
+        DOCKER_SOCK_GID=$(stat -c '%g' /var/run/docker.sock)
+        if ! getent group docker &>/dev/null; then
+            sudo groupadd -g "$DOCKER_SOCK_GID" docker
+        elif [[ "$(getent group docker | cut -d: -f3)" != "$DOCKER_SOCK_GID" ]]; then
+            sudo groupmod -g "$DOCKER_SOCK_GID" docker 2>/dev/null || true
+        fi
+        sudo usermod -aG docker odoo
+        sudo chmod 666 /var/run/docker.sock
+    fi
+
+    # gcloud
     if ! command -v gcloud &>/dev/null; then
         echo "Instalando gcloud CLI..."
         sudo apt-get -qq update \
