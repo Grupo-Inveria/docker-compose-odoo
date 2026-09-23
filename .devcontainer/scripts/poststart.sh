@@ -21,6 +21,11 @@ rm -rf "$HOME/workspace"                                                   # vie
 rm -rf "$HOME/custom/.claude" "$HOME/custom/.agents"                      # reset de las skills enlazadas (link_project_skills) y de las instaladas acá por error
 rm -rf "$HOME/custom/.codex" "$HOME/custom/.gemini"
 rm -f  "$HOME/custom/skills-lock.json"
+# gcp-logs quedó superada por la skill de workspace de Tuqui, que usa las tools del
+# connector GCP y no credenciales locales. La copia vieja en disco mintea un token
+# desde el adc.json montado, y ya no la declara ningún skills-lock.json, así que se
+# borra y no se reinstala. No es una poda general: es esta skill, por nombre.
+rm -rf "$HOME/.agents/skills/gcp-logs" "$HOME/.claude/skills/gcp-logs" "$HOME/.codex/skills/gcp-logs"
 
 # Overlay src/ dentro de custom/ — symlinks a repos baked de la imagen.
 # Los symlinks apuntan a paths internos del container; son válidos solo adentro.
@@ -1037,6 +1042,32 @@ else
     echo "Claude Code settings.json ya existe — respeto config propia ($CLAUDE_SETTINGS)"
 fi
 
+# Aviso de baja: gcp-credentials entra al catálogo de mounts con sólo tener gcloud
+# con una cuenta activa en el host, sin mirar R2_ENABLE_DEVOPS como sí hacen ~/.kube,
+# ~/.config/gcloud y ~/.docker. Sale sólo en las máquinas donde el mount existe sin
+# el flag, así que no le habla a quien no le toca.
+if [[ "${R2_ENABLE_DEVOPS:-0}" != "1" && -d "$HOME/gcloud_legacy_credentials" ]]; then
+    cat >&2 <<'AVISO'
+=====================================================================
+AVISO — tu credencial de GCP se está montando sin que la hayas pedido
+=====================================================================
+El devcontainer monta ~/gcloud_legacy_credentials (el refresh token de
+tu cuenta de gcloud) aunque no tengas R2_ENABLE_DEVOPS=1. No era la
+intención: los otros mounts de credenciales sí respetan ese flag.
+
+A partir del 2026-10-07 deja de montarse.
+
+- Si no la usás, no tenés que hacer nada.
+- Si la necesitás, agregá a tu bashrc del host:
+      export R2_ENABLE_DEVOPS=1
+- Para logs de instancias Odoo el camino es el connector GCP en Tuqui,
+  que no necesita credenciales locales.
+
+Si esto te rompe algo, decilo antes del 2026-10-07.
+=====================================================================
+AVISO
+fi
+
 if [[ "${R2_ENABLE_DEVOPS:-0}" == "1" ]]; then
     # kubectl
     if ! command -v kubectl &>/dev/null; then
@@ -1093,10 +1124,10 @@ if [[ "${R2_ENABLE_DEVOPS:-0}" == "1" ]]; then
                 | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list \
             && sudo apt-get -qq update \
             && sudo apt-get -qq install -y --no-install-recommends google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin \
-            && echo "gcloud $(gcloud version --format='value(Google Cloud SDK)') instalado." \
+            && echo "gcloud $(gcloud version --format='value("Google Cloud SDK")') instalado." \
             || echo "FALLO: no se pudo instalar gcloud"
     else
-        echo "gcloud ya presente ($(gcloud version --format='value(Google Cloud SDK)' 2>/dev/null))."
+        echo "gcloud ya presente ($(gcloud version --format='value("Google Cloud SDK")' 2>/dev/null))."
     fi
 fi
 
