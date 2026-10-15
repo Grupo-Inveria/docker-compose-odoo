@@ -26,6 +26,7 @@ rm -f  "$HOME/custom/skills-lock.json"
 # desde el adc.json montado, y ya no la declara ningún skills-lock.json, así que se
 # borra y no se reinstala. No es una poda general: es esta skill, por nombre.
 rm -rf "$HOME/.agents/skills/gcp-logs" "$HOME/.claude/skills/gcp-logs" "$HOME/.codex/skills/gcp-logs"
+rm -f  "$HOME/custom/GEMINI.md"                                            # pointer de gemini-cli (ver build_workspace)
 
 # Overlay src/ dentro de custom/ — symlinks a repos baked de la imagen.
 # Los symlinks apuntan a paths internos del container; son válidos solo adentro.
@@ -226,14 +227,11 @@ contesta acá mismo y cuándo hay que ir a leer el `AGENTS.md` de otro proyecto
 montado. No adelantes otras lecturas: el ruteo dice qué hace falta según el
 pedido.
 EOF
-    cat > "$CUSTOM/GEMINI.md" <<'EOF'
-# GEMINI.md
-**Antes de responder el primer mensaje de esta sesión, leé
-[`AGENTS.md`](./AGENTS.md)** — es la fuente canónica de instrucciones de este
-workspace, y trae el ruteo por tema: cuándo el pedido se contesta acá mismo y
-cuándo hay que ir a leer el `AGENTS.md` de otro proyecto montado. No adelantes
-otras lecturas: el ruteo dice qué hace falta según el pedido.
-EOF
+    # Sin pointer equivalente para Antigravity CLI (`agy`, que reemplazó a
+    # gemini-cli): lee AGENTS.md nativo en su discovery jerárquico — sus docs
+    # listan `GEMINI.md`, `AGENTS.md` y `.agents/rules/*.md` como "Directory &
+    # Project Rules" — así que el archivo puente sobraba. El GEMINI.md que
+    # generaban versiones anteriores se borra arriba, en la limpieza.
 
     echo "Overlay construido: custom/src/ ($src_count repos directos, $repo_count en repositories/)"
 }
@@ -309,7 +307,7 @@ echo "workspace-add y workspace-rm disponibles en $HOME/.local/bin/"
 # Transitorio pre-bake: cuando oci-odoo-by-adhoc los incluya en la imagen dev, sacar este bloque.
 export npm_config_prefix="$HOME/.local"
 
-# Node 20+ — requerido por OpenCode v1.14+, Gemini CLI y claude-code v2.
+# Node 20+ — requerido por OpenCode v1.14+ y claude-code v2.
 # User-local (N_PREFIX) para no requerir sudo, consistente con el patrón del bloque.
 # Transitorio pre-bake OCI: cuando la imagen dev traiga Node 20, sacar este bloque.
 export N_PREFIX="$HOME/.local"
@@ -348,7 +346,17 @@ install_cli_if_missing() {
 }
 install_cli_if_missing claude @anthropic-ai/claude-code
 install_cli_if_missing codex @openai/codex
-install_cli_if_missing gemini @google/gemini-cli
+# Antigravity CLI (`agy`) — reemplaza a gemini-cli, que ya no se instala.
+# No va por npm: es un binario nativo que la imagen dev ya trae bakeado en
+# /usr/local/bin/agy. Acá solo se verifica; si algún día faltara, el installer
+# oficial es `curl -fsSL https://antigravity.google/cli/install.sh | bash`
+# (deja ~/.local/bin/agy, ~210 MB, y no persiste entre rebuilds).
+if command -v agy &>/dev/null; then
+    echo "agy ya presente ($(command -v agy), $(agy --version 2>/dev/null || echo '?'))."
+else
+    echo "AVISO: agy (Antigravity CLI) no está en la imagen ni en el PATH."
+    echo "       Instalar con: curl -fsSL https://antigravity.google/cli/install.sh | bash"
+fi
 # OpenCode (sst/opencode) — runtime CLI alternativo a Claude Code y Codex.
 # Se mantiene en el devcontainer para que el dev pueda elegir agente.
 # Transitorio pre-bake OCI: cuando se baje al bake de la imagen dev, sacar de acá.
@@ -443,10 +451,25 @@ ensure_github_https_fallback() {
     fi
     if [ -n "$(git config --global --get-all url."https://github.com/".insteadOf 2>/dev/null)" ]; then
         echo "git: insteadOf hacia GitHub ya declarado; no lo piso."
+    else
+        git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+        # npm resolves github URLs as ssh://git@github.com/...
+        git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"
+        echo "git: SSH a GitHub no autentica; remotes git@github.com: y ssh://git@github.com/ reescritos a HTTPS."
+    fi
+    ensure_github_credential_helper
+}
+
+# Without VS Code (devcontainer CLI) nothing injects a credential helper for HTTPS.
+ensure_github_credential_helper() {
+    if git config --global --get-urlmatch credential.helper https://github.com >/dev/null 2>&1; then
         return 0
     fi
-    git config --global url."https://github.com/".insteadOf "git@github.com:"
-    echo "git: SSH a GitHub no autentica; remotes git@github.com: reescritos a HTTPS."
+    if gh auth status --hostname github.com >/dev/null 2>&1 && gh auth setup-git --hostname github.com; then
+        echo "git: sin credential helper para GitHub; uso el de gh."
+    else
+        echo "WARN: sin credential helper para GitHub ni sesión de gh; los remotes HTTPS van a fallar."
+    fi
 }
 ensure_github_https_fallback
 
@@ -730,7 +753,7 @@ collect_declared_skills() {
 validate_ingadhoc_skills() {
     local dir out rc=0 missing
     dir=$(mktemp -d)
-    if ! git clone --quiet --depth=1 git@github.com:ingadhoc/skills.git "$dir" 2>/dev/null; then
+    if ! GIT_TERMINAL_PROMPT=0 git clone --quiet --depth=1 git@github.com:ingadhoc/skills.git "$dir" 2>/dev/null; then
         echo "WARN: no pude clonar ingadhoc/skills para validar la lista — sigo sin validación."
         rm -rf "$dir"
         return 0
@@ -1108,6 +1131,12 @@ if [[ "${R2_ENABLE_DEVOPS:-0}" == "1" ]]; then
     else
         echo "gcloud ya presente ($(gcloud version --format='value("Google Cloud SDK")' 2>/dev/null))."
     fi
+
+    # Config del host → copia writable en el path canónico. Va afuera del if:
+    # gcloud viene bakeado en la imagen, así que el camino normal es el `else`.
+    # El mount del host es read-only y gcloud necesita escribir para renovar la
+    # sesión; el racional completo está en el script.
+    /scripts/user/gcloud-sync.sh || true
 fi
 
 if [[ "${AD_DEV_MODE:-}" == "MASTER" ]]; then
